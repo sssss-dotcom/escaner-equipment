@@ -71,7 +71,10 @@
 <script>
 (function () {
   var tg = window.Telegram && window.Telegram.WebApp;
-  var enTelegram = !!(tg && tg.initData);
+  // OJO: abierta desde un botón de TECLADO, Telegram NO manda initData (queda vacío).
+  // Por eso se detecta por la plataforma, no por initData.
+  var enTelegram = !!(tg && tg.platform && tg.platform !== "unknown");
+  var enCelular = enTelegram && (tg.platform === "ios" || tg.platform === "android");
   if (enTelegram) { document.documentElement.setAttribute("data-tg", "1"); tg.ready(); tg.expand(); }
   else { document.getElementById("fuera").classList.remove("oculto"); }
 
@@ -127,8 +130,18 @@
   });
 
   document.getElementById("btnEscanear").onclick = function () {
-    if (!enTelegram || !tg.isVersionAtLeast("6.4")) {
-      alert("Tu Telegram no soporta el escáner. Actualiza la app o escribe el ID abajo.");
+    if (!enTelegram) {
+      alert("Abre esta página desde el botón «📷 Escáner» del bot en Telegram.");
+      return;
+    }
+    if (!enCelular) {
+      alert("El escáner con cámara solo funciona en Telegram del celular (" + tg.platform +
+            "). Aquí puedes escribir el ID abajo.");
+      return;
+    }
+    if (!tg.isVersionAtLeast("6.4")) {
+      alert("Tu Telegram es muy viejo para el escáner (versión " + tg.version +
+            "). Actualiza la app o escribe el ID abajo.");
       return;
     }
     // Escaneo CONTINUO: el popup se queda abierto; cada QR nuevo se agrega a la lista.
