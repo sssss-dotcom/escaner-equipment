@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Escáner de equipo</title>
+<!-- Página estática SIN datos: solo junta los códigos escaneados y se los manda al bot
+     (Telegram.WebApp.sendData). El bot valida whitelist/PIN, resuelve el catálogo y pide
+     confirmación antes de escribir. No hay nombres, IDs de sesión ni rutas aquí. -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    /* Colores del tema de Telegram (claro/oscuro automático) con respaldo */
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --fg: var(--tg-theme-text-color, #1c1c1e);
+    --hint: var(--tg-theme-hint-color, #8e8e93);
+    --card: var(--tg-theme-secondary-bg-color, #f2f2f7);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-fg: var(--tg-theme-button-text-color, #ffffff);
+    --danger: var(--tg-theme-destructive-text-color, #d93a3a);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-tg]) { --bg:#1c1c1e; --fg:#f2f2f7; --card:#2c2c2e; --hint:#98989f; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:16px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  .modos { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:14px; }
+  .modo { border:2px solid transparent; background:var(--card); color:var(--fg);
+          border-radius:12px; padding:12px 8px; font-size:15px; text-align:left; }
+  .modo small { display:block; color:var(--hint); font-size:12px; margin-top:2px; }
+  .modo[aria-pressed="true"] { border-color:var(--accent); }
+  .escanear { width:100%; padding:16px; border:0; border-radius:12px; font-size:17px;
+              font-weight:600; background:var(--accent); color:var(--accent-fg); }
+  .manual { display:flex; gap:8px; margin-top:10px; }
+  .manual input { flex:1; min-width:0; padding:10px 12px; border-radius:10px; font-size:16px;
+                  border:1px solid var(--hint); background:var(--bg); color:var(--fg); }
+  .manual button { padding:0 14px; border-radius:10px; border:0; background:var(--card); color:var(--fg); font-size:20px; }
+  .cuenta { margin:16px 0 6px; color:var(--hint); font-size:14px; }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; align-items:center; justify-content:space-between; gap:8px;
+       background:var(--card); border-radius:10px; padding:10px 12px; margin-bottom:6px;
+       font-family: ui-monospace, Consolas, monospace; }
+  li button { border:0; background:none; color:var(--danger); font-size:20px; line-height:1; padding:0 4px; }
+  .aviso { background:var(--card); border-radius:10px; padding:12px; color:var(--hint); font-size:14px; }
+  .oculto { display:none; }
+</style>
+</head>
+<body>
+<h1>📷 Escáner de equipo</h1>
+
+<div class="modos" role="group" aria-label="¿Qué vas a hacer?">
+  <button class="modo" data-modo="salida">📦 Sacar a sesión<small>agrega a una sesión</small></button>
+  <button class="modo" data-modo="regreso">↩️ Regresar<small>vuelve al mueble</small></button>
+  <button class="modo" data-modo="prestamo">🤝 Prestar<small>sin sesión</small></button>
+  <button class="modo" data-modo="auditoria">🔎 Revisar mueble<small>escanea todo lo que hay</small></button>
+</div>
+
+<button class="escanear" id="btnEscanear">Escanear códigos</button>
+<div class="manual">
+  <input id="manual" placeholder="o escribe el ID (EQ-0001, KIT-01)" autocapitalize="characters" autocomplete="off">
+  <button id="btnManual" aria-label="Agregar">＋</button>
+</div>
+
+<p class="cuenta" id="cuenta">Nada escaneado aún.</p>
+<ul id="lista"></ul>
+
+<p class="aviso oculto" id="fuera">Abre esta página desde el botón «📷 Escáner» del bot en Telegram.</p>
+
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var enTelegram = !!(tg && tg.initData);
+  if (enTelegram) { document.documentElement.setAttribute("data-tg", "1"); tg.ready(); tg.expand(); }
+  else { document.getElementById("fuera").classList.remove("oculto"); }
+
+  var params = new URLSearchParams(location.search);
+  var modo = params.get("modo") || "salida";
+  var codigos = [];
+
+  // Acepta 'EQ-0001', 'KIT-01' o un enlace 'https://t.me/Bot?start=EQ-0001'
+  function limpiar(t) {
+    t = String(t || "").trim();
+    var m = t.match(/(?:start=|startapp=)([A-Za-z0-9_-]{1,64})/);
+    if (m) t = m[1];
+    t = t.toUpperCase();
+    return /^[A-Z0-9_-]{1,64}$/.test(t) ? t : "";
+  }
+
+  function vibrar(tipo) {
+    try { tg.HapticFeedback.notificationOccurred(tipo); } catch (e) {}
+  }
+
+  function agregar(t) {
+    var c = limpiar(t);
+    if (!c) { vibrar("error"); return false; }
+    if (codigos.indexOf(c) !== -1) { vibrar("warning"); return false; }
+    codigos.push(c); vibrar("success"); pintar(); return true;
+  }
+
+  function pintar() {
+    document.querySelectorAll(".modo").forEach(function (b) {
+      b.setAttribute("aria-pressed", b.dataset.modo === modo ? "true" : "false");
+    });
+    var ul = document.getElementById("lista");
+    ul.innerHTML = "";
+    codigos.forEach(function (c, i) {
+      var li = document.createElement("li");
+      var s = document.createElement("span"); s.textContent = c;
+      var x = document.createElement("button"); x.textContent = "×"; x.setAttribute("aria-label", "Quitar " + c);
+      x.onclick = function () { codigos.splice(i, 1); pintar(); };
+      li.appendChild(s); li.appendChild(x); ul.appendChild(li);
+    });
+    document.getElementById("cuenta").textContent =
+      codigos.length ? codigos.length + " código(s) listo(s):" : "Nada escaneado aún.";
+    if (!enTelegram) return;
+    if (codigos.length || modo === "auditoria") {
+      tg.MainButton.setText(modo === "auditoria" ? "Revisar con " + codigos.length + " escaneados"
+                                                 : "Enviar " + codigos.length + " al bot");
+      tg.MainButton.show();
+    } else { tg.MainButton.hide(); }
+  }
+
+  document.querySelectorAll(".modo").forEach(function (b) {
+    b.onclick = function () { modo = b.dataset.modo; pintar(); };
+  });
+
+  document.getElementById("btnEscanear").onclick = function () {
+    if (!enTelegram || !tg.isVersionAtLeast("6.4")) {
+      alert("Tu Telegram no soporta el escáner. Actualiza la app o escribe el ID abajo.");
+      return;
+    }
+    // Escaneo CONTINUO: el popup se queda abierto; cada QR nuevo se agrega a la lista.
+    tg.showScanQrPopup({ text: "Apunta a cada QR, uno tras otro. Cierra al terminar." }, function (texto) {
+      agregar(texto);
+      return false;   // false = seguir escaneando
+    });
+  };
+
+  function manual() {
+    var inp = document.getElementById("manual");
+    if (agregar(inp.value)) inp.value = "";
+    inp.focus();
+  }
+  document.getElementById("btnManual").onclick = manual;
+  document.getElementById("manual").addEventListener("keydown", function (e) { if (e.key === "Enter") manual(); });
+
+  if (enTelegram) {
+    tg.MainButton.onClick(function () {
+      // sendData: límite 4096 bytes. ~200 códigos caben de sobra.
+      tg.sendData(JSON.stringify({ v: 1, modo: modo, codigos: codigos.slice(0, 250) }));
+    });
+  }
+  pintar();
+})();
+</script>
+</body>
+</html>
