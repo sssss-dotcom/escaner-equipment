@@ -8,6 +8,8 @@
      (Telegram.WebApp.sendData). El bot valida whitelist/PIN, resuelve el catálogo y pide
      confirmación antes de escribir. No hay nombres, IDs de sesión ni rutas aquí. -->
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<!-- Lector de QR en JS (se usa si el celular no trae BarcodeDetector nativo) -->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
 <style>
   :root {
     /* Colores del tema de Telegram (claro/oscuro automático) con respaldo */
@@ -45,6 +47,28 @@
   li button { border:0; background:none; color:var(--danger); font-size:20px; line-height:1; padding:0 4px; }
   .aviso { background:var(--card); border-radius:10px; padding:12px; color:var(--hint); font-size:14px; }
   .oculto { display:none; }
+  /* ---- escáner propio: pantalla completa con mira ---- */
+  #cam { position:fixed; inset:0; background:#000; z-index:50; display:none; }
+  #cam.on { display:block; }
+  #cam video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #centro { position:absolute; inset:0 0 90px 0; display:flex; flex-direction:column; align-items:center;
+            justify-content:center; gap:18px; pointer-events:none; }
+  #mira { width:min(62vw,300px); height:min(62vw,300px); border-radius:18px;
+          box-shadow:0 0 0 9999px rgba(0,0,0,.55); border:3px solid #fff; transition:border-color .15s; }
+  #mira.ok { border-color:#34c759; } #mira.rep { border-color:#ffcc00; }
+  #aviso { padding:0 16px;
+           text-align:center; color:#fff; font-size:17px; font-weight:600; text-shadow:0 1px 3px #000; }
+  #leido { position:absolute; left:50%; top:16%; transform:translateX(-50%); padding:10px 18px;
+           border-radius:999px; font-size:18px; font-weight:700; color:#fff; opacity:0; transition:opacity .15s;
+           white-space:nowrap; }
+  #leido.ok { background:#34c759; opacity:1; } #leido.rep { background:#8e8e93; opacity:1; }
+  #barra { position:absolute; left:0; right:0; bottom:0; padding:16px 16px calc(16px + env(safe-area-inset-bottom));
+           display:flex; gap:10px; align-items:center; }
+  #barra button { border:0; border-radius:12px; padding:14px 16px; font-size:16px; font-weight:600; }
+  #btnListo { flex:1; background:var(--accent); color:var(--accent-fg); }
+  #btnLuz { background:rgba(255,255,255,.18); color:#fff; }
+  #cuentaCam { position:absolute; top:calc(12px + env(safe-area-inset-top)); left:16px; color:#fff;
+               font-size:15px; text-shadow:0 1px 3px #000; }
 </style>
 </head>
 <body>
@@ -65,6 +89,20 @@
 
 <p class="cuenta" id="cuenta">Nada escaneado aún.</p>
 <ul id="lista"></ul>
+
+<div id="cam" aria-live="polite">
+  <video id="video" playsinline muted></video>
+  <div id="cuentaCam">0 leídos</div>
+  <div id="leido"></div>
+  <div id="centro">
+    <div id="mira"></div>
+    <div id="aviso">Pon UN código dentro del cuadro</div>
+  </div>
+  <div id="barra">
+    <button id="btnLuz" class="oculto" aria-label="Linterna">🔦</button>
+    <button id="btnListo">Listo</button>
+  </div>
+</div>
 
 <p class="aviso oculto" id="fuera">Abre esta página desde el botón «📷 Escáner» del bot en Telegram.</p>
 
@@ -95,11 +133,12 @@
     try { tg.HapticFeedback.notificationOccurred(tipo); } catch (e) {}
   }
 
+  // Devuelve "nuevo" | "repetido" | "invalido"
   function agregar(t) {
     var c = limpiar(t);
-    if (!c) { vibrar("error"); return false; }
-    if (codigos.indexOf(c) !== -1) { vibrar("warning"); return false; }
-    codigos.push(c); vibrar("success"); pintar(); return true;
+    if (!c) { vibrar("error"); return "invalido"; }
+    if (codigos.indexOf(c) !== -1) { vibrar("warning"); return "repetido"; }
+    codigos.push(c); vibrar("success"); pintar(); return "nuevo";
   }
 
   function pintar() {
@@ -144,16 +183,125 @@
             "). Actualiza la app o escribe el ID abajo.");
       return;
     }
-    // Escaneo CONTINUO: el popup se queda abierto; cada QR nuevo se agrega a la lista.
+    abrirCamara();
+  };
+
+  // ------------------------------------------------------------------
+  // Escáner propio: SOLO lee lo que está dentro de la mira (tú eliges
+  // apuntando), avisa "Leído" y hace una pausa para no re-disparar.
+  // Si la página no obtiene la cámara, cae al escáner nativo de Telegram.
+  // ------------------------------------------------------------------
+  var stream = null, corriendo = false, pausaHasta = 0, ultimoRep = "", detector = null, ocupado = false;
+  var video = document.getElementById("video");
+  var lienzo = document.createElement("canvas");
+  var ctx2d = lienzo.getContext("2d", { willReadFrequently: true });
+
+  function escanerNativo() {
     tg.showScanQrPopup({ text: "Apunta a cada QR, uno tras otro. Cierra al terminar." }, function (texto) {
       agregar(texto);
-      return false;   // false = seguir escaneando
+      return false;
     });
+  }
+
+  function abrirCamara() {
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) { escanerNativo(); return; }
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    }).then(function (s) {
+      stream = s; video.srcObject = s;
+      return video.play();
+    }).then(function () {
+      document.getElementById("cam").classList.add("on");
+      if (enTelegram) tg.MainButton.hide();
+      try {
+        var cap = stream.getVideoTracks()[0].getCapabilities();
+        if (cap && cap.torch) document.getElementById("btnLuz").classList.remove("oculto");
+      } catch (e) {}
+      try { if ("BarcodeDetector" in window) detector = new BarcodeDetector({ formats: ["qr_code"] }); } catch (e) {}
+      corriendo = true; actualizarCuenta(); requestAnimationFrame(ciclo);
+    }).catch(function () {
+      cerrarCamara();
+      escanerNativo();
+    });
+  }
+
+  function cerrarCamara() {
+    corriendo = false;
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    document.getElementById("cam").classList.remove("on");
+    pintar();
+  }
+
+  function actualizarCuenta() {
+    document.getElementById("cuentaCam").textContent = codigos.length + " leído(s)";
+  }
+
+  function mostrar(clase, texto) {
+    var l = document.getElementById("leido"), m = document.getElementById("mira");
+    l.className = clase; l.textContent = texto; m.className = clase;
+    setTimeout(function () { l.className = ""; m.className = ""; }, 1100);
+  }
+
+  function resultado(texto) {
+    var c = limpiar(texto), r = agregar(texto);
+    if (r === "nuevo") {
+      mostrar("ok", "✅ Leído: " + c); pausaHasta = Date.now() + 1200; ultimoRep = c; actualizarCuenta();
+    } else if (r === "repetido" && c !== ultimoRep) {
+      mostrar("rep", "Ya estaba: " + c); pausaHasta = Date.now() + 900; ultimoRep = c;
+    }
+  }
+
+  // Recorta SOLO el área de la mira (en coordenadas del video) para decodificarla.
+  function recorteMira() {
+    var vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return 0;
+    var r = document.getElementById("mira").getBoundingClientRect();
+    var W = window.innerWidth, H = window.innerHeight;
+    var esc = Math.max(W / vw, H / vh);                 // object-fit: cover
+    var ox = (vw * esc - W) / 2, oy = (vh * esc - H) / 2;
+    // margen de 35% alrededor de la mira: si el QR se ve más grande que el cuadro (celular muy
+    // cerca) igual se lee; sigue siendo lo que está al centro, no lo de los lados.
+    var m = r.width * 0.35;
+    var sx = (r.left - m + ox) / esc, sy = (r.top - m + oy) / esc;
+    var sw = (r.width + 2 * m) / esc, sh = (r.height + 2 * m) / esc;
+    var lado = Math.max(1, Math.min(480, Math.round(sw)));
+    lienzo.width = lado; lienzo.height = lado;
+    ctx2d.drawImage(video, sx, sy, sw, sh, 0, 0, lado, lado);
+    return lado;
+  }
+
+  function ciclo() {
+    if (!corriendo) return;
+    if (!ocupado && Date.now() > pausaHasta && video.readyState >= 2) {
+      var lado = recorteMira();
+      if (lado) {
+        if (detector) {
+          ocupado = true;
+          detector.detect(lienzo).then(function (res) {
+            if (res && res.length) resultado(res[0].rawValue);
+          }).catch(function () { detector = null; }).then(function () { ocupado = false; });
+        } else if (window.jsQR) {
+          var img = ctx2d.getImageData(0, 0, lado, lado);
+          var q = jsQR(img.data, lado, lado, { inversionAttempts: "dontInvert" });
+          if (q && q.data) resultado(q.data);
+        }
+      }
+    }
+    requestAnimationFrame(ciclo);
+  }
+
+  var luz = false;
+  document.getElementById("btnLuz").onclick = function () {
+    if (!stream) return;
+    luz = !luz;
+    stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: luz }] }).catch(function () {});
   };
+  document.getElementById("btnListo").onclick = cerrarCamara;
 
   function manual() {
     var inp = document.getElementById("manual");
-    if (agregar(inp.value)) inp.value = "";
+    if (agregar(inp.value) === "nuevo") inp.value = "";
     inp.focus();
   }
   document.getElementById("btnManual").onclick = manual;
